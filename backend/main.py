@@ -1,8 +1,8 @@
 from fastapi import FastAPI, Depends, HTTPException
 from typing import List
 from . import schemas, database
+from .recommender_recbole import get_recommender
 from fastapi.middleware.cors import CORSMiddleware
-from .recommender_lightfm import get_recommender
 
 # This application uses `pyodbc` connections (provided by `backend.database.get_db`) instead of SQLAlchemy.
 
@@ -22,11 +22,15 @@ def get_db():
 
 
 @app.on_event("startup")
-def load_recommender():
+def load_recbole():
     try:
-        app.state.recommender = get_recommender()
+        # attempt to load recbole recommender (may be slow or require installed recbole/torch)
+        app.state.recbole = get_recommender()
     except Exception:
-        app.state.recommender = None
+        app.state.recbole = None
+
+
+# No LightFM startup loading; we'll use SQL-based popularity recommendations or RecBole externally
 
 @app.post("/users/", response_model=schemas.User)
 def create_user(user: schemas.UserCreate, db=Depends(get_db)):
@@ -123,44 +127,61 @@ def create_order(order: schemas.OrderCreate, user_id: int, db=Depends(get_db)):
 
 @app.get("/recommendations/{user_id}", response_model=List[schemas.Product])
 def get_recommendations(user_id: int, db=Depends(get_db)):
-    # If a LightFM model is available, use it. Otherwise fall back to random selection.
-    recommender = getattr(app.state, 'recommender', None)
     conn = db
     cursor = conn.cursor()
-    if recommender:
-        item_ids = recommender.recommend_for_user(str(user_id), k=5)
-        if not item_ids:
-            # fallback to random
-            cursor.execute(
-                "SELECT TOP 5 id, name, description, price, image_url, category FROM products ORDER BY NEWID()"
-            )
-            rows = cursor.fetchall()
-        else:
-            # item_ids are strings that should match product ids or keys used during training
-            # convert to ints where possible
-            try:
-                ids_int = [int(x) for x in item_ids]
-                placeholders = ','.join('?' for _ in ids_int)
-                sql = f"SELECT id, name, description, price, image_url, category FROM products WHERE id IN ({placeholders})"
-                cursor.execute(sql, *ids_int)
-                rows = cursor.fetchall()
-                # preserve recommender order
-                row_map = {int(r[0]): r for r in rows}
-                rows = [row_map[i] for i in ids_int if i in row_map]
-            except ValueError:
-                # non-integer item keys — fetch by string key column 'id' as TEXT, try direct match
-                placeholders = ','.join('?' for _ in item_ids)
-                sql = f"SELECT id, name, description, price, image_url, category FROM products WHERE CAST(id AS NVARCHAR(100)) IN ({placeholders})"
-                cursor.execute(sql, *item_ids)
-                rows = cursor.fetchall()
-    else:
+    rec = getattr(app.state, 'recbole', None)
+    if rec:
+        try:
+            item_ids = rec.recommend_for_user(str(user_id), k=5)
+            if item_ids:
+                # Try to fetch product rows by integer ids first
+                try:
+                    ids_int = [int(x) for x in item_ids]
+                    placeholders = ','.join('?' for _ in ids_int)
+                    sql = f"SELECT id, name, description, price, image_url, category FROM products WHERE id IN ({placeholders})"
+                    cursor.execute(sql, *ids_int)
+                    rows = cursor.fetchall()
+                    # preserve order
+                    row_map = {int(r[0]): r for r in rows}
+                    rows = [row_map[i] for i in ids_int if i in row_map]
+                except ValueError:
+                    placeholders = ','.join('?' for _ in item_ids)
+                    sql = f"SELECT id, name, description, price, image_url, category FROM products WHERE CAST(id AS NVARCHAR(100)) IN ({placeholders})"
+                    cursor.execute(sql, *item_ids)
+                    rows = cursor.fetchall()
+                results = []
+                for r in rows:
+                    results.append(
+                        {
+                            "id": int(r[0]),
+                            "name": r[1],
+                            "description": r[2],
+                            "price": float(r[3]) if r[3] is not None else None,
+                            "image_url": r[4],
+                            "category": r[5],
+                        }
+                    )
+                return results
+        except Exception:
+            # fall back to popularity
+            pass
+
+    # Popularity-based fallback
+    try:
+        cursor.execute(
+            "SELECT TOP 10 p.id, p.name, p.description, p.price, p.image_url, p.category, COUNT(oi.product_id) AS cnt "
+            "FROM products p LEFT JOIN order_items oi ON oi.product_id = p.id "
+            "GROUP BY p.id, p.name, p.description, p.price, p.image_url, p.category "
+            "ORDER BY cnt DESC"
+        )
+        rows = cursor.fetchall()
+    except Exception:
         cursor.execute(
             "SELECT TOP 5 id, name, description, price, image_url, category FROM products ORDER BY NEWID()"
         )
         rows = cursor.fetchall()
-
     results = []
-    for r in rows:
+    for r in rows[:5]:
         results.append(
             {
                 "id": int(r[0]),
@@ -174,48 +195,4 @@ def get_recommendations(user_id: int, db=Depends(get_db)):
     return results
 
 
-@app.get('/ml/recommend/{user_id}', response_model=List[schemas.Product])
-def recommend_ml(user_id: int, k: int = 5):
-    recommender = getattr(app.state, 'recommender', None)
-    if recommender is None:
-        raise HTTPException(status_code=503, detail='Recommender model not loaded')
-    ids = recommender.recommend_for_user(str(user_id), k=k)
-    # Return minimal structure: product ids (full product details require DB lookup endpoint)
-    # Attempt to return product dicts by querying DB via a new connection
-    conn = next(database.get_db())
-    try:
-        cursor = conn.cursor()
-        # Try integer cast
-        try:
-            ids_int = [int(x) for x in ids]
-            if not ids_int:
-                return []
-            placeholders = ','.join('?' for _ in ids_int)
-            sql = f"SELECT id, name, description, price, image_url, category FROM products WHERE id IN ({placeholders})"
-            cursor.execute(sql, *ids_int)
-            rows = cursor.fetchall()
-        except ValueError:
-            if not ids:
-                return []
-            placeholders = ','.join('?' for _ in ids)
-            sql = f"SELECT id, name, description, price, image_url, category FROM products WHERE CAST(id AS NVARCHAR(100)) IN ({placeholders})"
-            cursor.execute(sql, *ids)
-            rows = cursor.fetchall()
-        results = []
-        for r in rows:
-            results.append(
-                {
-                    "id": int(r[0]),
-                    "name": r[1],
-                    "description": r[2],
-                    "price": float(r[3]) if r[3] is not None else None,
-                    "image_url": r[4],
-                    "category": r[5],
-                }
-            )
-        return results
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+# ML-specific endpoints removed (switching to RecBole for ML training/inference)

@@ -11,7 +11,10 @@ pandas
 scikit-learn
 requests
 pyodbc
-lightfm
-scipy
-joblib
 recbole
+
+# LightFM-related packages removed (using RecBole).
+
+# Notes:
+# - Install a matching PyTorch wheel for your CUDA/CPU environment from https://pytorch.org before or instead of `pip install torch` if needed.
+# - `pyodbc` requires the ODBC Driver for SQL Server on Windows (ODBC Driver 17 or 18).
