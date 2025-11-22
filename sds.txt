@@ -1,4 +1,0 @@
-python tools\convert_retailrocket.py --dd-dir dd --out-dir data
-python tools\prepare_recbole.py --input data\interactions.csv --out dataset\retailrocket
-python finetune_bert4rec.py --dataset retailrocket --epochs 20
-uvicorn backend.main:app --reload
