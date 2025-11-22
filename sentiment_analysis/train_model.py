@@ -39,7 +39,7 @@ def train():
     # 5. Training Arguments
     training_args = TrainingArguments(
         output_dir="./results",
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         learning_rate=2e-5,
         per_device_train_batch_size=8,  # Small batch size for compatibility
         per_device_eval_batch_size=8,
@@ -58,6 +58,10 @@ def train():
     )
     
     # 7. Train
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    model.to(device)
+    
     print("Starting training...")
     trainer.train()
     
